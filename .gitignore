@@ -27,3 +27,4 @@ xo_text.json
 .vscode/
 *.code-workspace
 help.ipynb
+agent.ipynb
