@@ -1,0 +1,29 @@
+--- Python Basics ---
+
+pycache/
+*.py[cod]
+*$py.class
+
+--- Virtual Environment ---
+
+.venv/
+venv/
+env/
+
+--- Environment Variables (SICHERHEIT!) ---
+
+.env
+.env.local
+
+--- Project Specific Data (Generated) ---
+
+xo_brain/
+*.npy
+xo_vectors.npy
+xo_text.json
+
+--- VS Code Settings (Optional) ---
+
+.vscode/
+*.code-workspace
+help.ipynb
