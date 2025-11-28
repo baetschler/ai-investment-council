@@ -5,6 +5,7 @@ import json
 from dotenv import load_dotenv
 import numpy as np 
 
+
 # Lade Environment Variablen (.env Datei muss GOOGLE_API_KEY enthalten)
 load_dotenv()
 
@@ -18,6 +19,12 @@ from google.adk.runners import InMemoryRunner
 from google.adk.tools import AgentTool, google_search
 from google.genai import types
 from youtube_transcript_api import YouTubeTranscriptApi
+
+#MCP Imports
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+import sys
 
 print("✅ ADK components imported successfully.")
 
@@ -49,9 +56,9 @@ except Exception as e:
 
 # Standard Retry Config
 retry_config = types.HttpRetryOptions(
-    attempts=3,
+    attempts=5,
     exp_base=2,
-    initial_delay=1,
+    initial_delay=10,
     http_status_codes=[429, 500, 503]
 )
 
@@ -60,29 +67,39 @@ MODEL_NAME = "gemini-2.5-flash"
 
 # --- SYSTEM PROMPTS ---
 
-DATA_PROVIDER_SYSTEM = """
-Du bist 'data_provider', eine spezialisierte Daten-KI.
+PRICE_PROVIDER_SYSTEM = """
+Du bist 'price_provider', eine spezialisierte Daten-KI.
 Deine Aufgabe:
-1. Suche nach aktuellen Informationen zum gegebenen Asset (Google Search).
-2. Extrahiere Preis, Market Cap, KGV (PE Ratio), Makro-factors.
-3. Gib NUR valides JSON zurück.
+2. Nutze finance_mcp_tools, um Finanzdaten abzurufen.
+3. Konsolidiere alle Daten in einem JSON Objekt mit folgendem Format und gib es zurück.:
 
 Format:
 {
   "price": number or null,
+  "volume_24h": number or null,
+}
+"""
+
+TECHNICALS_PROVIDER_SYSTEM = """
+Du bist 'technicals_provider', eine spezialisierte Daten-KI.
+Deine Aufgabe:
+2. Nutze die websuche um Finanzdaten abzurufen.
+3. Konsolidiere alle Daten in einem JSON Objekt mit folgendem Format und gib es zurück.:
+
+Format:
+{
   "market_cap": string or null,
   "pe_ratio": number or null,
   "rsi_1d": number or null,
   "rsi_1w": number or null,
   "rsi_1m": number or null,
-  "volume_24h": number or null,
   "Federal_Reserve_policy",
   "macro_factors": [
     "Federal_Reserve_policy": number or null,
     "Economic_growth": number or null,
     "Interest_rates": number or null,
     "Inflation": number or null,
-    "Liquidity": 
+    "Liquidity": number or null,
   ]
 }
 """
@@ -90,6 +107,9 @@ Format:
 XO_SYSTEM = """
 Du bist 'xo', ein technischer Trader (Persona: TraderXO).
 Du hast Zugriff auf dein eigenes "Gehirn" via `consult_xo_brain`.
+
+Input: 
+- JSON Daten (asset_data) vom Research Agent.
 
 Workflow:
 1. Analysiere den Input.
@@ -113,33 +133,42 @@ Format:
   "longterm_confidence": int (0-100),
   "shortterm_setup": "bullish" | "bearish" | "neutral" | "unknown",
   "shortterm_confidence": int (0-100),
-  "reasoning": "Erklärung (zitiere XO Wissen wenn möglich), Maximal 2 Sätze"
+  "xo-reasoning": "Erklärung (zitiere XO Wissen wenn möglich), Maximal 2 Sätze"
 }
 """
 
 GLOBAL_SYSTEM = """
 Du bist 'global', eine Makro-KI.
-Input: JSON Daten (macro_factors).
-Aufgabe: Bestimme Makro-Regime und Liquidität.
+Input: 
+- JSON Daten (macro_factors).
+- ggf. technische Setups vom XO Agent.
+
+Aufgabe: Bestimme Makro-Regime und Liquidität. Beziehe auch Stellung zur Meinung der anderen Agenten.
 Gib NUR valides JSON zurück.
 
 Format:
 {
   "macro_regime": "risk_on" | "neutral" | "risk_off",
   "liquidity": int (0-100)
+  "global-reasoning": "Erklärung, Maximal 2 Sätze"
 }
 """
 
 WARREN_SYSTEM = """
 Du bist 'warren', ein Value-Investor.
-Input: JSON Daten (KGV, Market Cap).
-Aufgabe: Value-Einschätzung.
+Input: 
+- JSON Daten (KGV, Market Cap).
+- ggf. Einschätzung der Makro-Lage vom Global Agent.
+- ggf. technische Setups vom XO Agent.
+
+Aufgabe: Value-Einschätzung. Beziehe auch Stellung zur Meinung der anderen Agenten.
 Gib NUR valides JSON zurück.
 
 Format:
 {
   "value_opinion": "undervalued" | "fair" | "overvalued" | "unknown",
   "quality": int (0-100)
+  "warren-reasoning": "Erklärung, Maximal 2 Sätze"
 }
 """
 
@@ -152,13 +181,16 @@ Du erhältst JSON-Daten (Research-Ergebnisse) aus dem vorherigen Schritt der Pip
 AUFGABE:
 1. Analysiere die Input-Daten.
 2. Befrage nacheinander deine Experten-Tools, um ihre Meinungen einzuholen.
-   - Rufe `XO_Agent` auf.
+Du möchtest eine Diskussion zwischen den Experten anregen:
+   - Rufe `XO_Agent` auf. 
    - Rufe `Global_Agent` auf.
    - Rufe `Warren_Agent` auf.
-   
-   WICHTIG: Übergib an jedes Tool die *gesamten* Research-Daten, die du als Input erhalten hast.
 
-3. Nachdem alle 3 geantwortet haben, erstelle eine JSON-Liste mit Strings.
+   WICHTIG: Übergib an jedes Tool die *gesamten* Research-Daten, die du als Input erhalten hast und die Antworten der vorherigen Experten.
+
+   Mache 2 Runden der Befragung, um eine tiefere Diskussion zu ermöglichen.
+   
+3. Nachdem alle 3 jeweils 2 Mal geantwortet haben, erstelle eine JSON-Liste mit Strings.
    Jeder String soll die Kernaussage eines Experten + ein Fazit enthalten.
 
 OUTPUT FORMAT (JSON List):
@@ -172,13 +204,40 @@ OUTPUT FORMAT (JSON List):
 
 # --- AGENT DEFINITIONS ---
 
-# 1. Research Agent (Holt die Daten)
-research_agent = Agent(
-    name="ResearchAgent",
+# 1. Verbindungseinstellungen für MCP Tool
+# 2. Verbindung konfigurieren
+# Das sagt dem Agenten: "Starte python finance_server.py und rede mit ihm."
+server_params = StdioServerParameters(
+    command=sys.executable,         # Der Befehl
+    args=["committee_agent/finance_server.py"]  # Das Skript 
+)
+
+# 2. Dann das Paket übergeben (an 'server_params', nicht direkt command/args)
+connection_params = StdioConnectionParams(
+    server_params=server_params
+)
+
+# 3. Das Toolset erstellen
+finance_mcp_tools = McpToolset(
+    connection_params=connection_params
+)
+
+# 1. Price Agent (Holt Price + Volumen)
+price_agent = Agent(
+    name="Price_Agent",
     model=Gemini(model=MODEL_NAME, retry_options=retry_config, generation_config=json_generation_config),
-    instruction=DATA_PROVIDER_SYSTEM,
+    instruction=PRICE_PROVIDER_SYSTEM,
+    tools=[finance_mcp_tools],
+    output_key="price_data" 
+)
+
+# 2. Technial Agent (Holt weitere Asset Daten via Websuche)
+technicals_agent = Agent(
+    name="Technicals_Agent",
+    model=Gemini(model=MODEL_NAME, retry_options=retry_config, generation_config=json_generation_config),
+    instruction=TECHNICALS_PROVIDER_SYSTEM,
     tools=[google_search],
-    output_key="asset_data" 
+    output_key="technicals_data" 
 )
 
 # 2. Expert Agents (Werden als Tools genutzt)
@@ -270,7 +329,7 @@ roundtable_agent = Agent(
 # SequentialAgent übergibt automatisch den Output von Agent 1 als Input an Agent 2
 root_agent = SequentialAgent(
     name="root_agent",
-    sub_agents=[research_agent, roundtable_agent],
+    sub_agents=[price_agent, technicals_agent, roundtable_agent],
 )
 
 # --- EXECUTION ---

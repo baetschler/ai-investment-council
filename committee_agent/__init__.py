@@ -1,1 +1,1 @@
-from .committee_agent import agent
+from . import agent
